@@ -78,6 +78,15 @@ import { useToolbarFavoritesStore } from '../state/toolbar-favorites-store';
 import { roundToStep } from './number';
 import { applyCtunZoomCenterAfterState, centerCtunForZoomIn, centerKiwiForZoomIn } from './ctun-zoom-center';
 import { rulerDragTargetHz } from './use-ruler-pan-gesture';
+import { ensureLoupeHistory } from '../state/loupe-history';
+import {
+  isLoupeCancelZone,
+  LOUPE_HOLD_MS,
+  LOUPE_SLOP_PX,
+  loupeCommitHz,
+  LoupeOverlay,
+  type LoupeAim,
+} from './tuning-loupe';
 import {
   clampPointerFraction,
   isWidebandDisplayGeometry,
@@ -463,6 +472,7 @@ export function usePanTuneGesture(
     // pointer flows through the existing drag-to-tune path; ≥2 pointers
     // triggers pinch and suppresses any in-flight drag.
     const pointers = new Map<number, { x: number; y: number }>();
+    const pointerDownY = new Map<number, number>();
     let pinch: Pinch | null = null;
     let pendingHz: number | null = null;
     let pendingAbort: AbortController | null = null;
@@ -470,6 +480,83 @@ export function usePanTuneGesture(
     let pendingPanHz: number | null = null;
     let pendingPanAbort: AbortController | null = null;
     let pendingPanRaf = 0;
+
+    // Tuning loupe (touch / pen only). A press that stays within LOUPE_SLOP_PX
+    // for LOUPE_HOLD_MS becomes an AIM: a magnified view opens above the
+    // finger, sliding aims, lifting tunes, lifting in the cancel zone (off the
+    // display's sides, or well above/below it) leaves the dial alone. Moving
+    // before the hold fires is an ordinary drag, exactly as before.
+    let holdTimer = 0;
+    let loupe: { pointerId: number; x: number; y: number } | null = null;
+    let loupeOverlay: LoupeOverlay | null = null;
+    const touchFirst =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(pointer: coarse)').matches;
+    // On touch-first glass (the G2) record waterfall rows from mount, so the
+    // very first loupe already has history to magnify.
+    if (touchFirst && dragMode === 'tune') ensureLoupeHistory(receiver);
+    const cancelHold = () => {
+      if (holdTimer !== 0) {
+        clearTimeout(holdTimer);
+        holdTimer = 0;
+      }
+    };
+    const aimHzAt = (clientX: number): { hz: number; spanHz: number } | null => {
+      const rect = canvas.getBoundingClientRect();
+      const view = readView(receiver);
+      if (!view || rect.width <= 0) return null;
+      const frac = Math.min(1, Math.max(0, (clientX - rect.left) / rect.width));
+      return { hz: view.centerHz + (frac - 0.5) * view.spanHz, spanHz: view.spanHz };
+    };
+    const loupeAim = (): LoupeAim | null => {
+      if (!loupe) return null;
+      const at = aimHzAt(loupe.x);
+      if (!at) return null;
+      return {
+        clientX: loupe.x,
+        clientY: loupe.y,
+        aimHz: at.hz,
+        commitHz: loupeCommitHz(at.hz, useToolbarFavoritesStore.getState().stepHz),
+        viewSpanHz: at.spanHz,
+        // The cancel zone is judged against the whole spectrum stack (pan +
+        // waterfall of this receiver), so aiming may slide between the two.
+        cancel: isLoupeCancelZone(
+          loupe.x,
+          loupe.y,
+          (canvas.closest('[data-spectrum-stack]') ?? canvas).getBoundingClientRect(),
+        ),
+      };
+    };
+    const openLoupe = () => {
+      holdTimer = 0;
+      const d = drag;
+      if (!d || d.moved || pointers.size !== 1 || vfoLocked()) return;
+      const p = pointers.get(d.pointerId);
+      if (!p) return;
+      loupe = { pointerId: d.pointerId, x: p.x, y: p.y };
+      setDrag(null);
+      loupeOverlay ??= new LoupeOverlay(receiver, tuneReceiver);
+      loupeOverlay.open(loupeAim);
+      try {
+        navigator.vibrate?.(8);
+      } catch {
+        /* no haptics */
+      }
+      tuneDebugLog('LOUPE-OPEN', { x: p.x, id: d.pointerId });
+    };
+    const closeLoupe = (commit: boolean) => {
+      const aim = commit ? loupeAim() : null;
+      loupe = null;
+      loupeOverlay?.close();
+      canvas.style.cursor = idleCursor();
+      if (aim && !aim.cancel) {
+        tuneDebugLog('LOUPE-TUNE', { hz: aim.commitHz });
+        commitFinal(aim.commitHz, true);
+      } else {
+        tuneDebugLog('LOUPE-CANCEL', {});
+      }
+    };
 
     const pinchDistance = (): number => {
       const arr = Array.from(pointers.values());
@@ -756,10 +843,13 @@ export function usePanTuneGesture(
     const onPointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      pointerDownY.set(e.pointerId, e.clientY);
       // Two-finger pinch on mobile → zoom. Pinch always wins over an in-flight
       // single-pointer drag; we drop the drag state so the lifted finger
       // doesn't snap-tune on release.
       if (pointers.size >= 2) {
+        cancelHold();
+        if (loupe) closeLoupe(false);
         if (drag) setDrag(null);
         if (mapDrag) mapDrag = null;
         canvas.style.cursor = '';
@@ -829,6 +919,15 @@ export function usePanTuneGesture(
         pointerId: e.pointerId,
         pointerType: e.pointerType,
       });
+      if (
+        dragMode === 'tune' &&
+        (e.pointerType === 'touch' || e.pointerType === 'pen') &&
+        !vfoLocked()
+      ) {
+        ensureLoupeHistory(receiver);
+        cancelHold();
+        holdTimer = window.setTimeout(openLoupe, LOUPE_HOLD_MS);
+      }
       tuneDebugLog('DOWN', {
         mode: dragMode,
         x: e.clientX,
@@ -846,6 +945,14 @@ export function usePanTuneGesture(
       if (p) {
         p.x = e.clientX;
         p.y = e.clientY;
+      }
+      if (loupe) {
+        if (e.pointerId === loupe.pointerId) {
+          loupe.x = e.clientX;
+          loupe.y = e.clientY;
+        }
+        e.preventDefault();
+        return;
       }
       if (notchDrag) {
         const rect = canvas.getBoundingClientRect();
@@ -897,6 +1004,12 @@ export function usePanTuneGesture(
       }
       if (!drag) return;
       const dx = e.clientX - drag.startX;
+      // While the loupe hold is pending, small finger wobble is not a drag.
+      if (holdTimer !== 0 && !drag.moved) {
+        const dy = e.clientY - (pointerDownY.get(e.pointerId) ?? e.clientY);
+        if (Math.hypot(dx, dy) <= LOUPE_SLOP_PX) return;
+        cancelHold();
+      }
       if (!drag.moved && Math.abs(dx) <= CLICK_SLOP_PX) return;
       if (!drag.moved) tuneDebugLog('SLOP-PASS', { dx });
       drag.moved = true;
@@ -970,6 +1083,17 @@ export function usePanTuneGesture(
         moved: drag ? (drag.moved ? 'Y' : 'N') : '-',
       });
       pointers.delete(e.pointerId);
+      pointerDownY.delete(e.pointerId);
+      cancelHold();
+      if (loupe && e.pointerId === loupe.pointerId) {
+        if (canvas.hasPointerCapture(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+        loupe.x = e.clientX;
+        loupe.y = e.clientY;
+        // A cancelled touch carries no trustworthy coordinate — never tune on it.
+        closeLoupe(e.type !== 'pointercancel');
+        return;
+      }
+      if (loupe) return;
       if (notchDrag) {
         const start = notchDrag;
         notchDrag = null;
@@ -1147,6 +1271,10 @@ export function usePanTuneGesture(
     return () => {
       // Release any drag depth this instance still holds (unmount mid-drag).
       setDrag(null);
+      cancelHold();
+      loupe = null;
+      loupeOverlay?.destroy();
+      loupeOverlay = null;
       if (pendingRaf !== 0) cancelAnimationFrame(pendingRaf);
       if (pendingPanRaf !== 0) cancelAnimationFrame(pendingPanRaf);
       cancelPinchRaf();

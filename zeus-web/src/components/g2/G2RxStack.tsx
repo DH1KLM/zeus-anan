@@ -413,6 +413,7 @@ function RxPane({ receiver, heightPct }: { receiver: ReceiverKey; heightPct: num
   return (
     <div
       ref={paneRef}
+      data-spectrum-stack
       style={{ ...pane, height: `${heightPct}%` }}
       onPointerDownCapture={onCapturePointerDown}
     >

@@ -893,6 +893,185 @@ describe('usePanTuneGesture mobile touch mode', () => {
   // change the operating frequency, not just the digit display. These prove the
   // gesture is swallowed at the source (no setVfo/setRadioLo POST AND no
   // optimistic store write), while display-only zoom/pan stay live.
+  describe('tuning loupe (touch press-and-hold)', () => {
+    // View: 200 px canvas, 200 bins x 100 Hz around 14.2 MHz -> 100 Hz per px.
+    const LOUPE_HOLD = 300;
+    const loupeCanvas = () =>
+      document.querySelector('canvas[data-testid="tuning-loupe"]') as HTMLCanvasElement | null;
+    const loupeVisible = () => {
+      const c = loupeCanvas();
+      return !!c && c.style.display !== 'none';
+    };
+
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      useToolbarFavoritesStore.setState({ stepHz: 10 });
+      // jsdom has no 2D canvas; the overlay degrades to a no-draw element.
+      Object.defineProperty(HTMLCanvasElement.prototype, 'getContext', {
+        configurable: true,
+        value: vi.fn(() => null),
+      });
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('opens after a still hold and tunes to the release point on the tuning-step grid', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD);
+      });
+      expect(loupeVisible()).toBe(true);
+      // Aiming never tunes.
+      await act(async () => {
+        pointer(canvas, 'pointermove', { pointerId: 1, clientX: 123.4, clientY: 50 });
+        await flush();
+      });
+      expect(setVfoMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 123.4, clientY: 50 });
+        await flush();
+      });
+      // 14.2 MHz + 23.4 px x 100 Hz = 14 202 340 Hz — the 10 Hz step grid,
+      // not the 500 Hz drag grid.
+      expect(setVfoMock).toHaveBeenCalledTimes(1);
+      expect(setVfoMock).toHaveBeenCalledWith(14_202_340, undefined);
+      expect(loupeVisible()).toBe(false);
+      unmount();
+    });
+
+    it('ignores finger wobble inside the slop while the hold is pending', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        pointer(canvas, 'pointermove', { pointerId: 1, clientX: 106, clientY: 54 });
+        await flush();
+      });
+      expect(setVfoMock).not.toHaveBeenCalled();
+      await act(async () => {
+        vi.advanceTimersByTime(LOUPE_HOLD);
+      });
+      expect(loupeVisible()).toBe(true);
+      await act(async () => {
+        pointer(canvas, 'pointercancel', { pointerId: 1, clientX: 0, clientY: 0 });
+        await flush();
+      });
+      unmount();
+    });
+
+    it('is an ordinary drag when the finger moves before the hold fires', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        pointer(canvas, 'pointermove', { pointerId: 1, clientX: 140, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD * 2);
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 140, clientY: 50 });
+        await flush();
+      });
+      expect(loupeVisible()).toBe(false);
+      expect(setVfoMock).toHaveBeenCalled();
+      unmount();
+    });
+
+    it('leaves the dial alone when released in the cancel zone', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD);
+        // Slid off the right-hand side of the display.
+        pointer(canvas, 'pointermove', { pointerId: 1, clientX: 230, clientY: 50 });
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 230, clientY: 50 });
+        await flush();
+      });
+      expect(setVfoMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 2, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD);
+        // Well below the display (bottom 100 + 48 px margin).
+        pointer(canvas, 'pointerup', { pointerId: 2, clientX: 100, clientY: 200 });
+        await flush();
+      });
+      expect(setVfoMock).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('never tunes from a revoked touch while aiming', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD);
+        pointer(canvas, 'pointermove', { pointerId: 1, clientX: 150, clientY: 50 });
+        pointer(canvas, 'pointercancel', { pointerId: 1, clientX: 150, clientY: 50 });
+        await flush();
+      });
+      expect(setVfoMock).not.toHaveBeenCalled();
+      expect(loupeVisible()).toBe(false);
+      unmount();
+    });
+
+    it('a second finger closes the loupe without tuning', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD);
+        pointer(canvas, 'pointerdown', { pointerId: 2, clientX: 160, clientY: 50 });
+        pointer(canvas, 'pointerup', { pointerId: 2, clientX: 160, clientY: 50 });
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 100, clientY: 50 });
+        await flush();
+      });
+      expect(loupeVisible()).toBe(false);
+      expect(setVfoMock).not.toHaveBeenCalled();
+      unmount();
+    });
+
+    it('does not open for a mouse press-and-hold', async () => {
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50, pointerType: 'mouse' });
+        vi.advanceTimersByTime(LOUPE_HOLD * 2);
+      });
+      expect(loupeVisible()).toBe(false);
+      await act(async () => {
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 100, clientY: 50, pointerType: 'mouse' });
+        await flush();
+      });
+      unmount();
+    });
+
+    it('does not open while the VFO is locked', async () => {
+      useVfoLockStore.setState({ locked: true });
+      const { container, unmount } = render(createElement(GestureProbe, { touchMode: 'normal' }));
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement;
+
+      await act(async () => {
+        pointer(canvas, 'pointerdown', { pointerId: 1, clientX: 100, clientY: 50 });
+        vi.advanceTimersByTime(LOUPE_HOLD * 2);
+        pointer(canvas, 'pointerup', { pointerId: 1, clientX: 100, clientY: 50 });
+        await flush();
+      });
+      expect(loupeVisible()).toBe(false);
+      expect(setVfoMock).not.toHaveBeenCalled();
+      unmount();
+    });
+  });
+
   describe('with the VFO lock engaged', () => {
     beforeEach(() => {
       useVfoLockStore.setState({ locked: true });

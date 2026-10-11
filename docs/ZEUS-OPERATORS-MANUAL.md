@@ -90,6 +90,16 @@ Connect, then operate from the workspace:
 
 - **Tuning:** drag the waterfall, tap a signal, spin the encoder, or type a
   frequency. Band buttons remember per-band settings.
+- **Tuning loupe (touch):** press and hold a finger still on the panadapter
+  or waterfall for about a third of a second and a 4× magnifier opens above
+  your finger, so the signal you are aiming at is never hidden under it. The
+  magnifier shows the trace and recent waterfall, where your passband sits
+  now, and where it will land. Slide to aim — nothing changes while you
+  aim — and lift to tune there, on your tuning-step grid (STEP). To back out,
+  slide well off the display (off its sides, or about a fingertip above or
+  below it) until the readout says *Release to cancel*, then lift. A second
+  finger also cancels. Moving before the hold opens is an ordinary drag, as
+  always; the loupe never opens with a mouse or while the VFO is locked.
 - **Modes:** LSB / USB / CW / AM / FM / DIGI, with per-mode filter presets
   and adjustable edges.
 - **AGC** (with AGC-T gain), **squelch**, **attenuation** (S-ATT can also run
